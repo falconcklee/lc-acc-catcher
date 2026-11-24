@@ -69,6 +69,17 @@
   .status { font-size: 13px; color: var(--ok); min-height: 18px; }
   .opts { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--muted); font-size: 13px; margin-bottom: 10px; }
   .opts label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+  .order { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 10px;
+    color: var(--muted); font-size: 13px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg label { position: relative; cursor: pointer; }
+  .seg label + label { border-left: 1px solid var(--line); }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg span { display: block; padding: 5px 12px; color: var(--muted); }
+  .seg span small { font-size: 12px; opacity: .8; }
+  .seg label:hover span { color: var(--text); }
+  .seg input:checked + span { background: rgba(123,127,224,.18); color: var(--text); }
+  .seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
   .summary { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
   .summary b { color: var(--text); font-weight: 600; }
   .warnings { margin: 0 0 10px; padding: 8px 12px; border-radius: 8px;
@@ -95,7 +106,7 @@
 <body>
 <div class="wrap">
   <h1>Balance Converter</h1>
-  <p class="sub">Copy the account list from the website (selecting part of it or pressing Select All both work) and paste it here. Balances are sorted by account number (1, 2, 3 …), ready to paste into the sheet's Balance column.</p>
+  <p class="sub">Copy the account list from the website (selecting part of it or pressing Select All both work) and paste it here. Balances come out sorted by account number (1, 2, 3 …) or in LC order, the order they were copied in (1, 10, 11 …), ready to paste into the sheet's Balance column.</p>
 
   <div class="grid">
     <section class="card">
@@ -118,6 +129,14 @@
         <span id="status" class="status"></span>
       </div>
 
+      <div class="order" role="radiogroup" aria-label="Order">
+        Order
+        <div class="seg">
+          <label><input type="radio" name="order" value="number" checked><span>By number <small>1, 2, 3 …</small></span></label>
+          <label><input type="radio" name="order" value="lc"><span>LC order <small>as copied</small></span></label>
+        </div>
+      </div>
+
       <div class="opts">
         <label><input type="checkbox" id="zeroBlank" checked> Leave 0.00 blank</label>
         <label><input type="checkbox" id="commas" checked> Keep thousand separators</label>
@@ -137,7 +156,7 @@
         </table>
       </div>
 
-      <p class="hint">In the sheet, click the Balance cell for <b>Account 1</b>, then paste with <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>V</kbd>. Empty rows stay empty, so every value lands on the right account.</p>
+      <p class="hint">In the sheet, click the Balance cell for <b id="firstAcc">Account 1</b>, then paste with <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>V</kbd>. Empty rows stay empty, so every value lands on the right account.</p>
     </section>
   </div>
 </div>
@@ -193,6 +212,7 @@ function parseAccounts(text) {
     const raw = a[1];
     accounts.push({
       num: parseInt(numMatch[1], 10),
+      name,
       label,
       exchange: h[2].trim(),
       raw,
@@ -216,27 +236,48 @@ function ranges(nums) {
   return out.join(', ');
 }
 
-// Returns one row per account number from 1 (or 0) up to the highest found.
-function buildRows(accounts) {
-  const byNum = new Map();
+// Returns the rows to paste, one per account from 1 (or 0) up to the highest
+// found, with a blank row for any number missing from the paste. Order:
+//   'number': 1, 2, 3 …
+//   'lc':     the order the accounts were copied in. LC lists them by name as
+//             text (xyz+1, xyz+10, …, xyz+19, xyz+2, …), so when the paste is in
+//             that order and every name shares one prefix, a missing account
+//             still gets its blank row in the right place. Any other paste order
+//             is kept as is, and missing accounts are reported as `unplaced`.
+function buildRows(accounts, order = 'number') {
+  const byNum = new Map(); // insertion order = order in the paste
   const duplicates = [];
   for (const a of accounts) {
     if (byNum.has(a.num)) duplicates.push(a);
     else byNum.set(a.num, a);
   }
   const unnumbered = accounts.unnumbered || [];
-  if (!byNum.size) return { rows: [], duplicates, missing: [], unnumbered };
+  if (!byNum.size) return { rows: [], duplicates, missing: [], unplaced: [], unnumbered };
   const nums = [...byNum.keys()];
   const first = Math.min(1, ...nums);
   const last = Math.max(...nums);
-  const rows = [];
-  const missing = [];
-  for (let n = first; n <= last; n++) {
-    const a = byNum.get(n) || null;
-    if (!a) missing.push(n);
-    rows.push({ num: n, acc: a });
+  let slots = [];
+  for (let n = first; n <= last; n++) slots.push(n);
+  const missing = slots.filter((n) => !byNum.has(n));
+  let unplaced = [];
+
+  if (order === 'lc') {
+    const found = [...byNum.values()];
+    const prefixOf = (a) => a.name.replace(/\d+$/, '');
+    const prefix = prefixOf(found[0]);
+    const oneFamily = found.every((a) => prefixOf(a) === prefix);
+    const inLcOrder = found.every((a, i) => i === 0 || found[i - 1].name < a.name);
+    if (oneFamily && inLcOrder) {
+      const nameOf = (n) => (byNum.has(n) ? byNum.get(n).name : prefix + n);
+      slots.sort((x, y) => (nameOf(x) < nameOf(y) ? -1 : 1));
+    } else {
+      slots = found.map((a) => a.num);
+      unplaced = missing;
+    }
   }
-  return { rows, duplicates, missing, unnumbered };
+
+  const rows = slots.map((n) => ({ num: n, acc: byNum.get(n) || null }));
+  return { rows, duplicates, missing, unplaced, unnumbered };
 }
 
 function cellValue(acc, opts) {
@@ -256,23 +297,34 @@ if (typeof document !== 'undefined') {
   const input = $('input'), rowsEl = $('rows'), summaryEl = $('summary'),
         warnEl = $('warnings'), statusEl = $('status'),
         copyBtn = $('copy'), copyNamesBtn = $('copyNames'),
-        zeroBlank = $('zeroBlank'), commas = $('commas');
+        zeroBlank = $('zeroBlank'), commas = $('commas'), firstAccEl = $('firstAcc'),
+        orderInputs = [...document.querySelectorAll('input[name="order"]')];
 
   let current = { rows: [], duplicates: [], missing: [] };
   let statusTimer;
 
+  // The sheet's order rarely changes, so this browser remembers the last choice.
+  const ORDER_KEY = 'balanceConverter.order';
+  try {
+    const saved = localStorage.getItem(ORDER_KEY);
+    const match = orderInputs.find((i) => i.value === saved);
+    if (match) match.checked = true;
+  } catch {}
+
+  const getOrder = () => (orderInputs.find((i) => i.checked) || orderInputs[0]).value;
   const opts = () => ({ zeroBlank: zeroBlank.checked, commas: commas.checked });
 
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   function render() {
-    current = buildRows(parseAccounts(input.value));
-    const { rows, duplicates, missing, unnumbered } = current;
+    current = buildRows(parseAccounts(input.value), getOrder());
+    const { rows, duplicates, missing, unplaced, unnumbered } = current;
     const o = opts();
 
     copyBtn.disabled = copyNamesBtn.disabled = rows.length === 0;
     copyBtn.textContent = rows.length ? `Copy ${rows.length} balances` : 'Copy balances';
+    firstAccEl.textContent = `Account ${rows.length ? rows[0].num : 1}`;
 
     if (!rows.length) {
       rowsEl.innerHTML = `<tr><td colspan="4" class="empty">${
@@ -305,7 +357,9 @@ if (typeof document !== 'undefined') {
       `<b>${found.length - funded.length}</b> zero · Total <b>${fmt(total)}</b> USDT`;
 
     const warns = [];
-    if (missing.length) {
+    if (unplaced.length) {
+      warns.push(`Not in the pasted text: Account ${ranges(unplaced)}. The paste is not in LC's usual order, so there is no way to tell where their blank rows go, and every value after the gap would land on the wrong account. Copy again with every account included.`);
+    } else if (missing.length) {
       warns.push(`Not in the pasted text: Account ${ranges(missing)}. These rows will be left blank. Check the copy included every account.`);
     }
     for (const d of duplicates) {
@@ -357,6 +411,12 @@ if (typeof document !== 'undefined') {
   input.addEventListener('input', render);
   zeroBlank.addEventListener('change', render);
   commas.addEventListener('change', render);
+  for (const i of orderInputs) {
+    i.addEventListener('change', () => {
+      try { localStorage.setItem(ORDER_KEY, getOrder()); } catch {}
+      render();
+    });
+  }
   copyBtn.addEventListener('click', () => doCopy(false));
   copyNamesBtn.addEventListener('click', () => doCopy(true));
   $('clear').addEventListener('click', () => { input.value = ''; render(); input.focus(); });
