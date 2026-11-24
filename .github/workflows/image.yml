@@ -1,0 +1,73 @@
+# Builds the app's image on GitHub's runners and tests it under the server's hardening. A pull request stops there.
+# A push to main, or a manual run, then publishes that same tested image privately to GHCR as
+# ghcr.io/OWNER/REPO:sha-COMMIT, labelled with this repository, the commit and the build time. It deploys nothing
+# and holds no deploy credential: deploy.sh deploys an image by its digest when someone runs it by hand, e.g.
+#   ./deploy.sh deploy APP --env staging --image sha256:DIGEST                  (the digest the job summary shows)
+#   ./deploy.sh deploy APP --env production --image staging --confirm HOST      (exactly what staging serves)
+# The only token is GitHub's own short-lived one: no permission at all unless a job asks; the test job reads this
+# repository; the publish job also pushes this repository's package, nothing else.
+name: image
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build --pull -t app:pr .
+      - name: Test under the server's hardening
+        run: bash .github/smoke-test.sh app:pr
+  publish:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          image=$(printf '%s' "ghcr.io/$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          docker build --pull \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$image:sha-$GITHUB_SHA" .
+          echo "IMAGE=$image:sha-$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Test under the server's hardening
+        run: bash .github/smoke-test.sh "$IMAGE"
+      - name: Publish the tested image
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          docker logout ghcr.io
+          {
+            echo "### Image"
+            echo
+            echo "\`$digest\`, built from \`$GITHUB_SHA\`"
+            echo
+            echo "Deploy it by hand (nothing deploys by itself):"
+            echo
+            echo "- staging: \`./deploy.sh deploy APP --env staging --image ${digest#*@}\`"
+            echo "- production, once staging serves it: \`./deploy.sh deploy APP --env production --image staging --confirm HOST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
